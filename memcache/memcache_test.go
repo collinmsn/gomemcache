@@ -19,6 +19,7 @@ package memcache
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -62,7 +63,7 @@ func TestUnixSocket(t *testing.T) {
 		if _, err := os.Stat(sock); err == nil {
 			break
 		}
-		time.Sleep(time.Duration(25*i) * time.Millisecond)
+		time.Sleep(time.Duration(25 * i) * time.Millisecond)
 	}
 
 	testWithClient(t, New(sock))
@@ -227,4 +228,91 @@ func testTouchWithClient(t *testing.T, c *Client) {
 			t.Fatalf("unexpected error retrieving bar: %v", err.Error())
 		}
 	}
+}
+
+func TestDeadRetry(t *testing.T) {
+	servers := []string{"127.0.0.1:411211", "127.0.0.1:411212", "127.0.0.1:411213"}
+	cmds := make([]*exec.Cmd, len(servers))
+
+	for i, server := range servers {
+		cmd := exec.Command("memcached", "-p", strings.Split(server, ":")[1])
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		cmds[i] = cmd
+		if i != 0 {
+			defer cmd.Wait()
+			defer cmd.Process.Kill()
+		}
+	}
+	ss := new(DefaultDynamicServerSelector)
+	ss.SetServers(servers...)
+	c := NewFromSelector(ss)
+
+	hc := GetDefaultHealthChecker()
+	hc.Start()
+	defer hc.Stop()
+	hc.Register(ss, ss.addrs, ss.OnServerStatusChanged)
+	hc.Register(c, ss.addrs, c.OnServerStatusChanged)
+	testLongRun(t, c)
+
+	restartDone := make(chan bool, 1)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cmds[0].Process.Kill()
+		cmds[0].Wait()
+		log.Printf("process %d killed", cmds[0].Process.Pid)
+		time.Sleep(5 * time.Second)
+		cmd := exec.Command("memcached", "-p", strings.Split(servers[0], ":")[1])
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		cmds[0] = cmd
+		log.Printf("process %d started", cmds[0].Process.Pid)
+		restartDone <- true
+	}()
+	<-restartDone
+	defer cmds[0].Wait()
+	defer cmds[0].Process.Kill()
+}
+
+func testLongRun(t *testing.T, c *Client) {
+	var concurrency = 5
+	runDuration := 20 * time.Second
+	opInterval := time.Millisecond
+	taskPerWorker := int(runDuration / opInterval)
+	// concurrently set
+	errChan := make(chan error, 1000)
+	for i := 0; i < concurrency; i++ {
+		go func(start, num int) {
+			for k := start; k < start+num; k++ {
+				key := fmt.Sprintf("%03d", k)
+				item := &Item{Key: key, Value: []byte("val"), Flags: 123}
+				c.Set(item)
+				time.Sleep(1 * time.Millisecond)
+			}
+		}(i*taskPerWorker, taskPerWorker)
+	}
+	time.Sleep(100 * time.Millisecond)
+	// concurrently get
+	for i := 0; i < concurrency; i++ {
+		go func(start, num int) {
+			for k := start; k < start+num; k++ {
+				key := fmt.Sprintf("%03d", k)
+				_, err := c.Get(key)
+				errChan <- err
+				time.Sleep(1 * time.Millisecond)
+			}
+		}(i*taskPerWorker, taskPerWorker)
+	}
+
+	var missCount = 0
+	for i := 0; i < concurrency*taskPerWorker; i++ {
+		if err := <-errChan; err == nil {
+			continue
+		} else if err == ErrCacheMiss || err == ErrRetryLimitReached {
+			missCount += 1
+		}
+	}
+	t.Logf("total: %d, miss: %d", concurrency*taskPerWorker, missCount)
 }

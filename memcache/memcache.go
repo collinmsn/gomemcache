@@ -62,6 +62,9 @@ var (
 
 	// ErrNoServers is returned when no servers are configured or available.
 	ErrNoServers = errors.New("memcache: no servers configured or available")
+
+	// ErrRetryLimitReached is returned when server has retried max retry times
+	ErrRetryLimitReached = errors.New("memcache: retry limit has reached")
 )
 
 // DefaultTimeout is the default socket read/write timeout.
@@ -206,6 +209,15 @@ func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
 	c.freeconn[addr.String()] = append(freelist, cn)
 }
 
+func (c *Client) OnServerStatusChanged(addr net.Addr, status ServerStatusType) {
+	if status == ServerStatusAlive {
+		return
+	}
+	c.lk.Lock()
+	defer c.lk.Unlock()
+	delete(c.freeconn, addr.String())
+}
+
 func (c *Client) getFreeConn(addr net.Addr) (cn *conn, ok bool) {
 	c.lk.Lock()
 	defer c.lk.Unlock()
@@ -301,8 +313,8 @@ func (c *Client) FlushAll() error {
 // memcache cache miss. The key must be at most 250 bytes in length.
 func (c *Client) Get(key string) (item *Item, err error) {
 	err = c.withKeyAddr(key, func(addr net.Addr) error {
-		return c.getFromAddr(addr, []string{key}, func(it *Item) { item = it })
-	})
+			return c.getFromAddr(addr, []string{key}, func(it *Item) { item = it })
+		})
 	if err == nil && item == nil {
 		err = ErrCacheMiss
 	}
@@ -315,8 +327,8 @@ func (c *Client) Get(key string) (item *Item, err error) {
 // key is not in the cache. The key must be at most 250 bytes in length.
 func (c *Client) Touch(key string, seconds int32) (err error) {
 	return c.withKeyAddr(key, func(addr net.Addr) error {
-		return c.touchFromAddr(addr, []string{key}, seconds)
-	})
+			return c.touchFromAddr(addr, []string{key}, seconds)
+		})
 }
 
 func (c *Client) withKeyAddr(key string, fn func(net.Addr) error) (err error) {
@@ -341,52 +353,29 @@ func (c *Client) withAddrRw(addr net.Addr, fn func(*bufio.ReadWriter) error) (er
 
 func (c *Client) withKeyRw(key string, fn func(*bufio.ReadWriter) error) error {
 	return c.withKeyAddr(key, func(addr net.Addr) error {
-		return c.withAddrRw(addr, fn)
-	})
+			return c.withAddrRw(addr, fn)
+		})
 }
 
 func (c *Client) getFromAddr(addr net.Addr, keys []string, cb func(*Item)) error {
 	return c.withAddrRw(addr, func(rw *bufio.ReadWriter) error {
-		if _, err := fmt.Fprintf(rw, "gets %s\r\n", strings.Join(keys, " ")); err != nil {
-			return err
-		}
-		if err := rw.Flush(); err != nil {
-			return err
-		}
-		if err := parseGetResponse(rw.Reader, cb); err != nil {
-			return err
-		}
-		return nil
-	})
+			if _, err := fmt.Fprintf(rw, "gets %s\r\n", strings.Join(keys, " ")); err != nil {
+				return err
+			}
+			if err := rw.Flush(); err != nil {
+				return err
+			}
+			if err := parseGetResponse(rw.Reader, cb); err != nil {
+				return err
+			}
+			return nil
+		})
 }
 
 // flushAllFromAddr send the flush_all command to the given addr
 func (c *Client) flushAllFromAddr(addr net.Addr) error {
 	return c.withAddrRw(addr, func(rw *bufio.ReadWriter) error {
-		if _, err := fmt.Fprintf(rw, "flush_all\r\n"); err != nil {
-			return err
-		}
-		if err := rw.Flush(); err != nil {
-			return err
-		}
-		line, err := rw.ReadSlice('\n')
-		if err != nil {
-			return err
-		}
-		switch {
-		case bytes.Equal(line, resultOk):
-			break
-		default:
-			return fmt.Errorf("memcache: unexpected response line from flush_all: %q", string(line))
-		}
-		return nil
-	})
-}
-
-func (c *Client) touchFromAddr(addr net.Addr, keys []string, expiration int32) error {
-	return c.withAddrRw(addr, func(rw *bufio.ReadWriter) error {
-		for _, key := range keys {
-			if _, err := fmt.Fprintf(rw, "touch %s %d\r\n", key, expiration); err != nil {
+			if _, err := fmt.Fprintf(rw, "flush_all\r\n"); err != nil {
 				return err
 			}
 			if err := rw.Flush(); err != nil {
@@ -397,16 +386,39 @@ func (c *Client) touchFromAddr(addr net.Addr, keys []string, expiration int32) e
 				return err
 			}
 			switch {
-			case bytes.Equal(line, resultTouched):
+			case bytes.Equal(line, resultOk):
 				break
-			case bytes.Equal(line, resultNotFound):
-				return ErrCacheMiss
 			default:
-				return fmt.Errorf("memcache: unexpected response line from touch: %q", string(line))
+				return fmt.Errorf("memcache: unexpected response line from flush_all: %q", string(line))
 			}
-		}
-		return nil
-	})
+			return nil
+		})
+}
+
+func (c *Client) touchFromAddr(addr net.Addr, keys []string, expiration int32) error {
+	return c.withAddrRw(addr, func(rw *bufio.ReadWriter) error {
+			for _, key := range keys {
+				if _, err := fmt.Fprintf(rw, "touch %s %d\r\n", key, expiration); err != nil {
+					return err
+				}
+				if err := rw.Flush(); err != nil {
+					return err
+				}
+				line, err := rw.ReadSlice('\n')
+				if err != nil {
+					return err
+				}
+				switch {
+				case bytes.Equal(line, resultTouched):
+					break
+				case bytes.Equal(line, resultNotFound):
+					return ErrCacheMiss
+				default:
+					return fmt.Errorf("memcache: unexpected response line from touch: %q", string(line))
+				}
+			}
+			return nil
+		})
 }
 
 // GetMulti is a batch version of Get. The returned map from keys to
@@ -615,15 +627,15 @@ func writeExpectf(rw *bufio.ReadWriter, expect []byte, format string, args ...in
 // returned if the item didn't already exist in the cache.
 func (c *Client) Delete(key string) error {
 	return c.withKeyRw(key, func(rw *bufio.ReadWriter) error {
-		return writeExpectf(rw, resultDeleted, "delete %s\r\n", key)
-	})
+			return writeExpectf(rw, resultDeleted, "delete %s\r\n", key)
+		})
 }
 
 // DeleteAll deletes all items in the cache.
 func (c *Client) DeleteAll() error {
 	return c.withKeyRw("", func(rw *bufio.ReadWriter) error {
-		return writeExpectf(rw, resultDeleted, "flush_all\r\n")
-	})
+			return writeExpectf(rw, resultDeleted, "flush_all\r\n")
+		})
 }
 
 // Increment atomically increments key by delta. The return value is
@@ -648,22 +660,22 @@ func (c *Client) Decrement(key string, delta uint64) (newValue uint64, err error
 func (c *Client) incrDecr(verb, key string, delta uint64) (uint64, error) {
 	var val uint64
 	err := c.withKeyRw(key, func(rw *bufio.ReadWriter) error {
-		line, err := writeReadLine(rw, "%s %s %d\r\n", verb, key, delta)
-		if err != nil {
-			return err
-		}
-		switch {
-		case bytes.Equal(line, resultNotFound):
-			return ErrCacheMiss
-		case bytes.HasPrefix(line, resultClientErrorPrefix):
-			errMsg := line[len(resultClientErrorPrefix) : len(line)-2]
-			return errors.New("memcache: client error: " + string(errMsg))
-		}
-		val, err = strconv.ParseUint(string(line[:len(line)-2]), 10, 64)
-		if err != nil {
-			return err
-		}
-		return nil
-	})
+			line, err := writeReadLine(rw, "%s %s %d\r\n", verb, key, delta)
+			if err != nil {
+				return err
+			}
+			switch {
+			case bytes.Equal(line, resultNotFound):
+				return ErrCacheMiss
+			case bytes.HasPrefix(line, resultClientErrorPrefix):
+				errMsg := line[len(resultClientErrorPrefix) : len(line)-2]
+				return errors.New("memcache: client error: " + string(errMsg))
+			}
+			val, err = strconv.ParseUint(string(line[:len(line) - 2]), 10, 64)
+			if err != nil {
+				return err
+			}
+			return nil
+		})
 	return val, err
 }
